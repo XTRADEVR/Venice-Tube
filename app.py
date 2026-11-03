@@ -144,8 +144,8 @@ class DNSRouter:
             return True, f"{ms:.0f} ms -> {ips[0]}"
         else:
             return False, "tidak ada jawaban"
-
-def human(num):    try:
+def human(num):
+    try:
         num = float(num)
     except:
         return "?"
@@ -158,6 +158,10 @@ def human(num):    try:
     return "?"
 
 def human_time(sec):
+    try:
+        sec = int(sec)
+    except:
+        return "--:--"
     try:
         sec = int(sec)
     except:
