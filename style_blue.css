@@ -1,0 +1,24 @@
+/* Venice - Blue Shimmer V2 Ultra Light */
+.stApp {
+    background: radial-gradient(ellipse at top left, #061a3a 0%, #0a2e6b 30%, #1565c0 70%, #1e88e5 100%);
+    background-attachment: fixed;
+}
+.stApp::before {
+    content: ""; position: fixed; inset: -20%;
+    background-image: 
+        radial-gradient(circle at 25% 20%, rgba(120,200,255,0.18) 0%, transparent 40%),
+        radial-gradient(circle at 75% 80%, rgba(66,165,245,0.22) 0%, transparent 45%);
+    pointer-events: none; will-change: transform;
+    transform: translate3d(0,0,0);
+    animation: shimmerFloat 18s infinite ease-in-out;
+}
+@keyframes shimmerFloat {
+    0%,100%{transform:translate3d(0,0,0) scale(1);opacity:0.8}
+    50%{transform:translate3d(20px,-15px,0) scale(1.05);opacity:1}
+}
+[data-testid="stSidebar"]{
+    background:rgba(6,26,58,0.85)!important;
+    backdrop-filter:blur(8px); border-right:1px solid rgba(66,165,245,0.25);
+}
+[data-testid="stHeader"]{background:transparent!important}
+h1,h2,h3{color:#e3f2fd!important;text-shadow:0 0 12px rgba(66,165,245,0.5)}
