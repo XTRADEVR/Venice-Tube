@@ -224,7 +224,7 @@ class _Logger:
         if not msg.startswith("[debug]"): self.job.log.append(msg)
     def info(self, msg): self.job.log.append(msg)
     def warning(self, msg): self.job.log.append(f"WARN: {msg}")
-        def error(self, msg): self.job.log.append(f"ERROR: {msg}")
+    def error(self, msg): self.job.log.append(f"ERROR: {msg}")
 
 class JobManager:
     def __init__(self, cfg):
