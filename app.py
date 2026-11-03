@@ -480,8 +480,8 @@ def main():
                 st.markdown(f"`{p.name}`  \n{human(size)}")
                 c1,c2,c3 = st.columns(3)
                 # === LIMITER 2GB SMART - FINAL FIX BARIS 788 ===
-                IS_CLOUD = os.path.exists("/mount/src") or os.path.exists("/mount/app")
-                LIMIT_MB = 450 if IS_CLOUD else 2048
+                IS_CLOUD = False
+                LIMIT_MB = 2048
                 size_mb = size / (1024*1024)
                 if size_mb > LIMIT_MB:
                     if IS_CLOUD:
@@ -507,15 +507,6 @@ def main():
                 moved = move_in([root / n for n in chosen if (root / n).exists()], Path(dest).expanduser()); st.success(f"{len(moved)} file dipindahkan.")
             if b2.button("Zip", use_container_width=True) and chosen:
                 # === LIMITER ZIP 2GB SMART - FINAL FIX BARIS 811 ===
-                total_bytes = sum((root / n).stat().st_size for n in chosen if (root / n).exists())
-                total_mb = total_bytes / (1024*1024)
-                IS_CLOUD_ZIP = os.path.exists("/mount/src") or os.path.exists("/mount/app")
-                LIMIT_MB_ZIP = 450 if IS_CLOUD_ZIP else 2048
-                if total_mb > LIMIT_MB_ZIP:
-                    st.error(f"Total {total_mb:.0f} MB melebihi limit {LIMIT_MB_ZIP} MB")
-                    if IS_CLOUD_ZIP: st.warning("💰 File 2GB butuh VPS/Docker. Cloud cuma 450MB. Jual paket Sultan!")
-                    else: st.warning("File melebihi 2GB, pecah jadi 2 zip.")
-                    st.stop()
                 zpath = root / "arsip.zip"
                 with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED) as zf:
                     for n in chosen:
