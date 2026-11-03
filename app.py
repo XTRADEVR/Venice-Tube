@@ -21,14 +21,22 @@ IS_ANDROID = Path("/storage/emulated/0").exists() or Path("/sdcard").exists()
 
 st.set_page_config(page_title=APP, page_icon="🎬", layout="centered")
 st.markdown('''
-<style>
-.stApp{background:radial-gradient(ellipse at top left,#061a3a 0%,#0a2e6b 25%,#1565c0 60%,#1e88e5 85%,#42a5f5 100%);background-attachment:fixed}
-.stApp::before{content:"";position:fixed;inset:0;background-image:radial-gradient(circle at 20% 30%,rgba(255,255,255,0.15) 0%,transparent 50%),radial-gradient(circle at 80% 70%,rgba(100,200,255,0.2) 0%,transparent 40%);pointer-events:none;animation:shimmerMove 12s infinite ease-in-out}
-@keyframes shimmerMove{0%,100%{transform:translate(0,0) scale(1);filter:brightness(1)}50%{transform:translate(15px,-10px) scale(1.05);filter:brightness(1.25)}}
-[data-testid="stSidebar"]{background:rgba(6,26,58,0.9)!important;backdrop-filter:blur(12px);border-right:1px solid rgba(66,165,245,0.3)}
-[data-testid="stHeader"]{background:rgba(0,0,0,0)!important}
-h1,h2,h3{color:#e3f2fd!important;text-shadow:0 0 15px rgba(66,165,245,0.6)}
-</style>
+# === PREMIUM DUAL THEME SWITCHER - BIKIN HARGA JUAL NAIK ===
+from pathlib import Path
+BASE_THEME = Path(__file__).resolve().parent
+
+theme = st.sidebar.radio(
+    "🎨 Tema Premium",
+    ["💎 Blue Shimmer", "🌑 Midnight Black"],
+    horizontal=True,
+    help="Midnight lebih hemat baterai & RAM"
+)
+
+css_name = "style_blue.css" if "Blue" in theme else "style_midnight.css"
+css_path = BASE_THEME / css_name
+
+if css_path.exists():
+    st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
 ''', unsafe_allow_html=True)
 
 try:
