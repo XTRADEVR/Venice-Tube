@@ -132,17 +132,21 @@ class DNSRouter:
         return _ORIG_GH(host)
     def install(self):
         if not self._installed and HAS_DNS:
-            socket.getaddrinfo=self._ga; socket.gethostbyname=self._gh; self._installed=True
-    def probe(self):
-        if not HAS_DNS: return False, "dnspython belum terpasang"
-        t0=time.perf_counter(); ips=self.resolve("one.one.one.one",True,False); ms=(time.perf_counter()-t0)*1000
-        return (True,f"{ms:.0f} ms -> {ips[0]}") if ips else (False,"tidak ada jawaban")def human(num):
-    try: num=float(num)
-    except: return "?"
-    if num<=0: return "0 B"
-    for unit in ("B","KB","MB","GB","TB"):
-        if num<1024 or unit=="TB": return f"{num:.1f} {unit}"
-        num/=1024
+                def probe(self):
+        if not HAS_DNS:
+            return False, "dnspython belum terpasang"
+        t0 = time.perf_counter()
+        ips = self.resolve("one.one.one.one", True, False)
+        ms = (time.perf_counter() - t0) * 1000
+        return (True, f"{ms:.0f} ms -> {ips[0]}") if ips else (False, "tidak ada jawaban")
+
+def human(num):
+    try:
+        num = float(num)
+    except (TypeError, ValueError):
+        return "?"
+    if num <= 0:
+        return "0 B"
     return "?"
 
 def human_time(sec):
