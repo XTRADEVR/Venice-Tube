@@ -224,7 +224,9 @@ class _Logger:
         if not msg.startswith("[debug]"): self.job.log.append(msg)
     def info(self, msg): self.job.log.append(msg)
     def warning(self, msg): self.job.log.append(f"WARN: {msg}")
-    def error(self, msg): self.job.log.append(f"ERROR: {msg}")class JobManager:
+        def error(self, msg): self.job.log.append(f"ERROR: {msg}")
+
+class JobManager:
     def __init__(self, cfg):
         self.cfg = dict(cfg); self._jobs = {}; self._lock = threading.RLock(); self._q = queue.Queue(); self._stop = threading.Event(); self._workers = []; self._target = max(1, min(int(cfg.get("parallel", 1) or 1), 4)); self.session_bytes = 0; self._ensure_workers()
     def update_cfg(self, cfg):
