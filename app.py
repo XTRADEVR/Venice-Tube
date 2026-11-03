@@ -20,8 +20,7 @@ BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 IS_ANDROID = Path("/storage/emulated/0").exists() or Path("/sdcard").exists()
 
 st.set_page_config(page_title=APP, page_icon="🎬", layout="centered")
-st.markdown('''
-# === PREMIUM DUAL THEME SWITCHER - BIKIN HARGA JUAL NAIK ===
+# === PREMIUM DUAL THEME SWITCHER - BIKIN HARGA NAIK ===
 from pathlib import Path
 BASE_THEME = Path(__file__).resolve().parent
 
@@ -37,7 +36,6 @@ css_path = BASE_THEME / css_name
 
 if css_path.exists():
     st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
-''', unsafe_allow_html=True)
 
 try:
     import dns.message, dns.rdatatype, dns.resolver, requests
