@@ -5,3 +5,4 @@ requests>=2.32.3
 curl-cffi>=0.7.4
 certifi>=2024.8.30
 mutagen>=1.47.0
+pycryptodomex
