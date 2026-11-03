@@ -1,667 +1,387 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Venice Tube Grabber
-Streamlit downloader berbasis yt-dlp dengan DNS paksa Cloudflare 1.1.1.1
-(UDP / DNS-over-HTTPS) dan target penyimpanan ke kartu memori HP.
-
-Jalankan:
-    streamlit run app.py --server.address 0.0.0.0 --server.port 8501
-"""
-
+"""Venice Tube Grabber — Streamlit + yt-dlp, DNS 1.1.1.1, antrean worker."""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import shutil
-import socket
-import tempfile
-import threading
-import time
+import subprocess
+import sys
+import zipfile
 from pathlib import Path
 
-import dns.message
-import dns.rdatatype
-import dns.resolver
 import requests
 import streamlit as st
-import yt_dlp
 
-try:  # opsional: impersonasi TLS ala browser
-    from yt_dlp.networking.impersonate import ImpersonateTarget
+import config
+import dns_router
+import storage
+from downloader import JobManager
 
-    HAS_IMPERSONATE = True
-except Exception:
-    ImpersonateTarget = None
-    HAS_IMPERSONATE = False
-
-APP_TITLE = "Venice Tube Grabber"
-CF_V4 = ["1.1.1.1", "1.0.0.1"]
-CF_DOH = "https://cloudflare-dns.com/dns-query"
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+APP = "Venice Tube Grabber"
 FFMPEG = shutil.which("ffmpeg")
 ARIA2C = shutil.which("aria2c")
 
+st.set_page_config(page_title=APP, page_icon="🎬", layout="centered")
 
-# --------------------------------------------------------------------------- #
-# DNS router: semua resolusi dipaksa lewat Cloudflare 1.1.1.1
-# --------------------------------------------------------------------------- #
-class DNSRouter:
-    def __init__(self) -> None:
-        self._orig_getaddrinfo = socket.getaddrinfo
-        self._orig_gethostbyname = socket.gethostbyname
-        self._cache: dict[tuple, tuple[float, list[str]]] = {}
-        self._lock = threading.Lock()
-        self._local = threading.local()
-        self.mode = "system"          # system | udp | doh
-        self.ipv4_only = True
-        self.ttl = 300.0
-        self._resolver = dns.resolver.Resolver(configure=False)
-        self._resolver.nameservers = CF_V4
-        self._resolver.timeout = 4.0
-        self._resolver.lifetime = 6.0
 
-    # ---------------------------- query ---------------------------- #
-    def _doh(self, name: str, rdtype: int) -> list[str]:
-        query = dns.message.make_query(name, rdtype, use_edns=False)
-        resp = requests.post(
-            CF_DOH,
-            data=query.to_wire(),
-            headers={
-                "Content-Type": "application/dns-message",
-                "Accept": "application/dns-message",
-                "User-Agent": UA,
-            },
-            timeout=8,
-        )
-        resp.raise_for_status()
-        msg = dns.message.from_wire(resp.content)
-        out: list[str] = []
-        for rrset in msg.answer:
-            if rrset.rdtype != rdtype:
-                continue
-            for rr in rrset:
-                out.append(rr.address)
-        return out
+def boot() -> None:
+    if "cfg" not in st.session_state:
+        st.session_state["cfg"] = config.load()
+    dns_router.ROUTER.install()
+    dns_router.ROUTER.mode = st.session_state["cfg"].get("dns_mode", "udp")
+    dns_router.ROUTER.ipv4_only = st.session_state["cfg"].get("ipv4_only", True)
 
-    def _udp(self, name: str, rdtype: int) -> list[str]:
-        ans = self._resolver.resolve(name, rdtype, raise_on_no_answer=False)
-        if ans.rrset is None:
-            return []
-        return [r.address for r in ans]
 
-    def resolve(self, host: str, want4: bool, want6: bool) -> list[str]:
-        key = (host, int(want4), int(want6), self.mode)
-        now = time.monotonic()
-        with self._lock:
-            hit = self._cache.get(key)
-            if hit and hit[0] > now:
-                return list(hit[1])
-
-        ips: list[str] = []
-        tasks = []
-        if want4:
-            tasks.append(dns.rdatatype.A)
-        if want6:
-            tasks.append(dns.rdatatype.AAAA)
-        for rdtype in tasks:
-            try:
-                if self.mode == "doh":
-                    ips.extend(self._doh(host, rdtype))
-                else:
-                    ips.extend(self._udp(host, rdtype))
-            except Exception:
-                continue
-
-        with self._lock:
-            self._cache[key] = (now + self.ttl, list(ips))
-        return ips
-
-    # ------------------------ patched socket ----------------------- #
-    def _patched_getaddrinfo(self, host, port, family=0, type=0, proto=0, flags=0):
-        orig = self._orig_getaddrinfo
-        if (
-            self.mode == "system"
-            or host is None
-            or isinstance(host, bytes)
-            or getattr(self._local, "busy", False)
+def login_gate() -> bool:
+    expected = (os.environ.get("APP_PASSWORD") or "").strip()
+    if not expected:
+        return True
+    if st.session_state.get("authed"):
+        return True
+    st.title("🎬 " + APP)
+    with st.form("login"):
+        pwd = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Masuk", use_container_width=True)
+    if ok:
+        if hmac.compare_digest(
+            hashlib.sha256(pwd.encode()).hexdigest(),
+            hashlib.sha256(expected.encode()).hexdigest(),
         ):
-            return orig(host, port, family, type, proto, flags)
-
-        host = str(host)
-        for fam, probe in (
-            (socket.AF_INET, socket.inet_pton),
-            (socket.AF_INET6, socket.inet_pton),
-        ):
-            try:
-                probe(fam, host)
-                return orig(host, port, family, type, proto, flags)
-            except OSError:
-                pass
-
-        want6 = family == socket.AF_INET6 or (family == 0 and not self.ipv4_only)
-        want4 = family in (0, socket.AF_INET)
-
-        self._local.busy = True
-        try:
-            ips = self.resolve(host, want4, want6)
-        finally:
-            self._local.busy = False
-
-        if not ips:
-            return orig(host, port, family, type, proto, flags)
-
-        socktype = type or socket.SOCK_STREAM
-        results = []
-        for ip in ips:
-            if ":" in ip:
-                if family == socket.AF_INET:
-                    continue
-                fam = socket.AF_INET6
-                sockaddr = (ip, port or 0, 0, 0)
-            else:
-                if family == socket.AF_INET6:
-                    continue
-                fam = socket.AF_INET
-                sockaddr = (ip, port or 0)
-            results.append((fam, socktype, proto or 0, "", sockaddr))
-
-        if not results:
-            return orig(host, port, family, type, proto, flags)
-        return results
-
-    def _patched_gethostbyname(self, host):
-        if self.mode == "system":
-            return self._orig_gethostbyname(host)
-        try:
-            infos = self._patched_getaddrinfo(
-                host, 0, socket.AF_INET, socket.SOCK_STREAM
-            )
-        except Exception:
-            return self._orig_gethostbyname(host)
-        for fam, _, _, _, sockaddr in infos:
-            if fam == socket.AF_INET:
-                return sockaddr[0]
-        return self._orig_gethostbyname(host)
-
-    def install(self) -> None:
-        socket.getaddrinfo = self._patched_getaddrinfo
-        socket.gethostbyname = self._patched_gethostbyname
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.session_state["fails"] = st.session_state.get("fails", 0) + 1
+            st.error(f"Password salah ({st.session_state['fails']}x).")
+    return False
 
 
-@st.cache_resource(show_spinner=False)
-def dns_router() -> DNSRouter:
-    router = DNSRouter()
-    router.install()
-    return router
+def persist(cfg: dict) -> None:
+    if cfg != st.session_state.get("_saved"):
+        config.save(cfg)
+        st.session_state["_saved"] = dict(cfg)
 
 
-# --------------------------------------------------------------------------- #
-# Util
-# --------------------------------------------------------------------------- #
-def human(num) -> str:
-    try:
-        num = float(num)
-    except (TypeError, ValueError):
-        return "?"
-    if num <= 0:
-        return "0 B"
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if num < 1024 or unit == "TB":
-            return f"{num:.1f} {unit}"
-        num /= 1024
-    return f"{num:.1f} TB"
-
-
-def human_time(sec) -> str:
-    try:
-        sec = int(sec)
-    except (TypeError, ValueError):
-        return "--:--"
-    if sec < 0:
-        return "--:--"
-    m, s = divmod(sec, 60)
-    h, m = divmod(m, 60)
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-
-
-def default_dir() -> str:
-    env = os.environ.get("DL_DIR")
-    if env:
-        return env
-    for cand in (
-        "/storage/emulated/0/Download/VeniceGrab",
-        "/sdcard/Download/VeniceGrab",
-        str(Path.home() / "Downloads" / "VeniceGrab"),
-    ):
-        if Path(cand).parent.exists():
-            return cand
-    return str(Path.cwd() / "downloads")
-
-
-class YTLogger:
-    def __init__(self) -> None:
-        self.lines: list[str] = []
-
-    def debug(self, msg: str) -> None:
-        if msg.startswith("[debug]"):
-            return
-        self.lines.append(msg)
-
-    def info(self, msg: str) -> None:
-        self.lines.append(msg)
-
-    def warning(self, msg: str) -> None:
-        self.lines.append(f"WARN: {msg}")
-
-    def error(self, msg: str) -> None:
-        self.lines.append(f"ERROR: {msg}")
-
-
-class UI:
-    """Progress bar + detail, di-throttle supaya UI tidak banjir update."""
-
-    def __init__(self) -> None:
-        self.bar = st.progress(0.0, text="Menyiapkan...")
-        self.detail = st.empty()
-        self._last = 0.0
-
-    def reset(self) -> None:
-        self.bar.progress(0.0, text="Menyiapkan...")
-        self.detail.empty()
-
-    def hook(self, d: dict) -> None:
-        status = d.get("status")
-        now = time.monotonic()
-        if status == "downloading":
-            if now - self._last < 0.35:
-                return
-            self._last = now
-            done = d.get("downloaded_bytes") or 0
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            frac = (done / total) if total else 0.0
-            self.bar.progress(
-                min(max(frac, 0.0), 1.0), text=f"Mengunduh {frac * 100:.1f}%"
-            )
-            self.detail.markdown(
-                f"**{human(done)}** / {human(total) if total else '?'} · "
-                f"{human(d.get('speed'))}/s · sisa {human_time(d.get('eta'))}"
-            )
-        elif status == "finished":
-            self.bar.progress(1.0, text="Selesai unduh, memproses file...")
-            self.detail.markdown(f"`{Path(d.get('filename', '')).name}`")
-        elif status == "error":
-            self.bar.progress(0.0, text="Gagal")
-
-
-def build_opts(cfg: dict) -> dict:
-    """Susun opsi yt-dlp dari konfigurasi UI."""
-    opts: dict = {
-        "paths": {"home": str(cfg["dl_dir"])},
-        "outtmpl": {"default": "%(title).150B [%(id)s].%(ext)s"},
-        "windowsfilenames": True,
-        "trim_file_name": 120,
-        "overwrites": False,
-        "continuedl": True,
-        "nopart": False,
-        "quiet": True,
-        "noprogress": True,
-        "no_warnings": True,
-        "ignoreerrors": True,
-        "retries": 20,
-        "fragment_retries": 20,
-        "socket_timeout": 30,
-        "concurrent_fragment_downloads": cfg["fragments"],
-        "http_chunk_size": cfg["chunk"],
-        "geo_bypass": True,
-        "nocheckcertificate": cfg["insecure"],
-        "http_headers": {"User-Agent": UA},
-        "logger": cfg["logger"],
-        "progress_hooks": [cfg["hook"]],
-        "postprocessor_hooks": [cfg["pp_hook"]],
-        "noplaylist": not cfg["playlist"],
-    }
-
-    if cfg["format"]:
-        opts["format"] = cfg["format"]
+def manager(cfg: dict) -> JobManager:
+    mgr = st.session_state.get("mgr")
+    if mgr is None:
+        mgr = JobManager(cfg)
+        st.session_state["mgr"] = mgr
     else:
-        opts["format"] = "bv*+ba/b"
-    opts["merge_output_format"] = "mp4"
-
-    if cfg["proxy"]:
-        opts["proxy"] = cfg["proxy"]
-    if cfg["rate"]:
-        opts["ratelimit"] = int(cfg["rate"] * 1024 * 1024)
-    if cfg["cookies"]:
-        opts["cookiefile"] = cfg["cookies"]
-
-    postprocessors: list[dict] = []
-    if cfg["audio_only"]:
-        opts["format"] = "ba/b"
-        postprocessors.append(
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        )
-    if cfg["subs"]:
-        opts.update(
-            {
-                "writesubtitles": True,
-                "writeautomaticsub": True,
-                "subtitleslangs": ["id", "en"],
-                "subtitlesformat": "srt/best",
-            }
-        )
-    if cfg["thumb"]:
-        opts["writethumbnail"] = True
-        postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
-    if postprocessors:
-        opts["postprocessors"] = postprocessors
-
-    if cfg["impersonate"] and HAS_IMPERSONATE:
-        try:
-            opts["impersonate"] = ImpersonateTarget("chrome")
-        except Exception:
-            pass
-
-    if cfg["aria2c"] and ARIA2C:
-        opts["external_downloader"] = {"default": ARIA2C}
-        opts["external_downloader_args"] = {
-            "aria2c": ["-x", "16", "-s", "16", "-k", "1M", "--file-allocation=none"]
-        }
-
-    return opts
+        mgr.update_cfg(cfg)
+    return mgr
 
 
-# --------------------------------------------------------------------------- #
-# App
-# --------------------------------------------------------------------------- #
+def latest_ytdlp() -> str:
+    try:
+        r = requests.get("https://pypi.org/pypi/yt-dlp/json", timeout=10)
+        return r.json()["info"]["version"]
+    except Exception:
+        return "?"
+
+
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-    router = dns_router()
+    boot()
+    if not login_gate():
+        return
 
-    st.session_state.setdefault("dl_dir", default_dir())
-    st.session_state.setdefault("info", None)
-    st.session_state.setdefault("info_url", "")
+    cfg = st.session_state["cfg"]
+    mgr = manager(cfg)
 
-    # ------------------------------ sidebar ------------------------------ #
     with st.sidebar:
         st.header("Jaringan")
-        mode_label = st.radio(
-            "Resolver DNS",
-            ["Cloudflare 1.1.1.1 (UDP)", "Cloudflare DoH", "Sistem"],
-            index=0,
-            help="UDP 1.1.1.1 = resolusi paling cepat. DoH = terenkripsi.",
+        mode = st.radio(
+            "Resolver",
+            ["udp", "doh", "system"],
+            index=["udp", "doh", "system"].index(cfg.get("dns_mode", "udp")),
+            format_func=lambda m: {
+                "udp": "Cloudflare 1.1.1.1 (UDP)",
+                "doh": "Cloudflare DoH",
+                "system": "Sistem",
+            }[m],
         )
-        router.mode = {
-            "Cloudflare 1.1.1.1 (UDP)": "udp",
-            "Cloudflare DoH": "doh",
-            "Sistem": "system",
-        }[mode_label]
-        router.ipv4_only = st.checkbox("IPv4 saja (paling stabil)", value=True)
-        st.caption("Semua koneksi app dipaksa lewat resolver terpilih.")
+        cfg["dns_mode"] = mode
+        cfg["ipv4_only"] = st.checkbox("IPv4 saja", value=cfg.get("ipv4_only", True))
+        dns_router.ROUTER.mode = mode
+        dns_router.ROUTER.ipv4_only = cfg["ipv4_only"]
+        if st.button("Uji resolver", use_container_width=True):
+            ok, msg = dns_router.ROUTER.probe()
+            (st.success if ok else st.error)(msg)
 
         st.divider()
         st.header("Penyimpanan")
-        c1, c2, c3 = st.columns(3)
+        cfg["dl_dir"] = st.text_input("Folder", value=cfg["dl_dir"])
+        c1, c2 = st.columns(2)
         if c1.button("Kartu SD", use_container_width=True):
-            st.session_state["dl_dir"] = "/storage/emulated/0/Download/VeniceGrab"
+            cfg["dl_dir"] = "/storage/emulated/0/Download/VeniceGrab"
+            st.rerun()
         if c2.button("Movies", use_container_width=True):
-            st.session_state["dl_dir"] = "/storage/emulated/0/Movies/VeniceGrab"
-        if c3.button("Lokal", use_container_width=True):
-            st.session_state["dl_dir"] = str(Path.cwd() / "downloads")
-        st.text_input("Folder tujuan", key="dl_dir")
-        st.caption("Termux/Android: jalankan `termux-setup-storage` dulu.")
+            cfg["dl_dir"] = "/storage/emulated/0/Movies/VeniceGrab"
+            st.rerun()
+        cfg["margin_mb"] = st.number_input("Margin aman (MB)", 50, 5000, int(cfg["margin_mb"]), 50)
+        cfg["quota_gb"] = st.number_input("Kuota sesi (GB, 0 = bebas)", 0.0, 500.0, float(cfg["quota_gb"]), 1.0)
 
         st.divider()
-        st.header("Kecepatan")
-        fragments = st.slider("Fragmen paralel", 1, 32, 16)
-        chunk = st.select_slider(
-            "Ukuran chunk HTTP",
-            options=[1048576, 5242880, 10485760, 20971520],
-            value=10485760,
-            format_func=human,
+        st.header("Kecepatan & format")
+        cfg["parallel"] = st.slider("Unduhan paralel", 1, 4, int(cfg["parallel"]))
+        cfg["fragments"] = st.slider("Fragmen paralel", 1, 32, int(cfg["fragments"]))
+        cfg["chunk"] = st.select_slider(
+            "Chunk HTTP", [1048576, 5242880, 10485760, 20971520], value=int(cfg["chunk"]), format_func=storage.human
         )
-        rate = st.number_input(
-            "Batas kecepatan (MB/s, 0 = tanpa batas)", min_value=0.0, value=0.0, step=1.0
+        cfg["rate"] = st.number_input("Batas MB/s (0 = bebas)", 0.0, 100.0, float(cfg["rate"]), 1.0)
+        cfg["quality"] = st.selectbox(
+            "Batas resolusi",
+            ["best", "1080", "720", "480", "360"],
+            index=["best", "1080", "720", "480", "360"].index(cfg["quality"]),
         )
-        use_aria2c = st.checkbox(
-            f"aria2c multi-koneksi ({'ada' if ARIA2C else 'tidak terpasang'})",
-            value=bool(ARIA2C),
-            disabled=not ARIA2C,
-        )
-        if use_aria2c and ARIA2C:
-            st.caption("aria2c: progress per-file tidak ditampilkan.")
+        cfg["compat"] = st.checkbox("Prioritaskan H.264/MP4 (kompatibel HP)", value=cfg["compat"])
+        cfg["audio_only"] = st.checkbox("Audio MP3 saja", value=cfg["audio_only"])
+        cfg["subs"] = st.checkbox("Subtitle", value=cfg["subs"])
+        cfg["thumb"] = st.checkbox("Sematkan thumbnail", value=cfg["thumb"])
+        cfg["playlist"] = st.checkbox("Ikuti playlist", value=cfg["playlist"])
+        cfg["restrict"] = st.checkbox("Nama file ASCII aman", value=cfg["restrict"])
 
         st.divider()
         st.header("Lainnya")
-        proxy = st.text_input("Proxy (opsional)", placeholder="http://ip:port")
-        insecure = st.checkbox("Abaikan sertifikat TLS", value=False)
-        use_impersonate = st.checkbox(
-            "Samarkan TLS seperti Chrome",
-            value=HAS_IMPERSONATE,
-            disabled=not HAS_IMPERSONATE,
-            help="Bantu untuk situs yang memblokir bot.",
-        )
-        cookie_file = st.file_uploader("cookies.txt (Netscape)", type=["txt"])
-
-        if FFMPEG:
-            st.success("ffmpeg siap (merge & konversi MP3).")
-        else:
-            st.warning("ffmpeg tidak ada: merge/MP3/thumbnail nonaktif.")
-
-    dl_dir = Path(st.session_state["dl_dir"]).expanduser()
-    try:
-        dl_dir.mkdir(parents=True, exist_ok=True)
-        test = dl_dir / ".venice_write_test"
-        test.write_bytes(b"1")
-        test.unlink()
-        dir_ok = True
-    except Exception as exc:
-        dir_ok = False
-        st.sidebar.error(f"Folder tidak siap: {exc}")
-
-    if dir_ok:
-        usage = shutil.disk_usage(dl_dir)
-        st.sidebar.caption(f"Kosong: **{human(usage.free)}** / {human(usage.total)}")
-
-    cookies_path = None
-    if cookie_file is not None:
-        cookies_path = Path(tempfile.gettempdir()) / "venice_cookies.txt"
-        cookies_path.write_bytes(cookie_file.getvalue())
-
-    # ------------------------------- main -------------------------------- #
-    st.title("🎬 Venice Tube Grabber")
-    st.caption(
-        f"Target: `{dl_dir}` · DNS: **{mode_label}** · "
-        f"Fragmen: **{fragments}** · ffmpeg: **{'ya' if FFMPEG else 'tidak'}**"
-    )
-
-    url_text = st.text_area(
-        "Tempel satu atau beberapa link (satu per baris)",
-        height=140,
-        placeholder="https://www.xvideos.com/video...\nhttps://www.pornhub.com/view_video.php?viewkey=...",
-    )
-
-    col_fetch, col_opts = st.columns([1, 3])
-    with col_fetch:
-        fetch = st.button("Ambil info", use_container_width=True)
-    with col_opts:
-        audio_only = st.checkbox("Audio saja (MP3)", value=False)
-        subs = st.checkbox("Unduh subtitle", value=False)
-        thumb = st.checkbox("Sematkan thumbnail", value=False)
-        playlist = st.checkbox("Ikuti playlist/semua bagian", value=False)
-
-    if fetch:
-        urls = [u.strip() for u in url_text.splitlines() if u.strip()]
-        if not urls:
-            st.warning("Isi minimal satu link.")
-        else:
-            st.session_state["info"] = None
-            st.session_state["info_url"] = urls[0]
-            logger = YTLogger()
-            probe_opts = {
-                "quiet": True,
-                "noprogress": True,
-                "no_warnings": True,
-                "skip_download": True,
-                "socket_timeout": 30,
-                "noplaylist": True,
-                "http_headers": {"User-Agent": UA},
-                "logger": logger,
-                "geo_bypass": True,
-            }
-            if proxy:
-                probe_opts["proxy"] = proxy
-            if cookies_path:
-                probe_opts["cookiefile"] = str(cookies_path)
-            if use_impersonate and HAS_IMPERSONATE:
+        cfg["proxy"] = st.text_input("Proxy", value=cfg["proxy"])
+        cfg["insecure"] = st.checkbox("Abaikan sertifikat TLS", value=cfg["insecure"])
+        cookie = st.file_uploader("cookies.txt", type=["txt"])
+        if cookie is not None:
+            path = config.BASE / ".config" / "cookies.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(cookie.getvalue())
+            try:
+                path.chmod(0o600)
+            except Exception:
+                pass
+            cfg["cookies"] = str(path)
+        if cfg.get("cookies"):
+            st.caption(f"Cookies aktif: `{Path(cfg['cookies']).name}`")
+            if st.button("Hapus cookies", use_container_width=True):
                 try:
-                    probe_opts["impersonate"] = ImpersonateTarget("chrome")
+                    Path(cfg["cookies"]).unlink()
                 except Exception:
                     pass
-            try:
-                with st.spinner("Mengambil metadata..."):
-                    with yt_dlp.YoutubeDL(probe_opts) as ydl:
-                        st.session_state["info"] = ydl.extract_info(urls[0], download=False)
-            except Exception as exc:
-                st.error(f"Gagal ambil info: {exc}")
-                if logger.lines:
-                    st.code("\n".join(logger.lines[-40:]))
+                cfg.pop("cookies", None)
+                st.rerun()
 
-    info = st.session_state.get("info")
-    chosen_format = None
-    if info:
-        if info.get("_type") == "playlist":
-            entries = info.get("entries") or []
-            st.info(f"Playlist terdeteksi: {len(entries)} item — aktifkan opsi playlist.")
-        st.markdown(
-            f"**{info.get('title', '(tanpa judul)')}**  \n"
-            f"Durasi {human_time(info.get('duration'))} · "
-            f"{info.get('uploader') or info.get('channel') or '-'} · "
-            f"{info.get('extractor_key')}"
-        )
-        if info.get("thumbnail"):
-            st.image(info["thumbnail"], width=320)
+        st.divider()
+        st.caption(f"ffmpeg: {'ada' if FFMPEG else 'TIDAK ADA'} · aria2c: {'ada' if ARIA2C else '-'}")
 
-        rows = []
-        for f in info.get("formats") or []:
-            if f.get("vcodec") == "none" and f.get("acodec") == "none":
-                continue
-            rows.append(
-                {
-                    "id": f.get("format_id"),
-                    "resolusi": f.get("resolution") or f.get("format_note") or "-",
-                    "ext": f.get("ext"),
-                    "vcodec": (f.get("vcodec") or "-")[:16],
-                    "acodec": (f.get("acodec") or "-")[:16],
-                    "ukuran": human(f.get("filesize") or f.get("filesize_approx")),
-                    "tbr": f.get("tbr") or 0,
-                }
-            )
-        rows.sort(key=lambda r: r["tbr"], reverse=True)
-        if rows:
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-            labels = ["auto (terbaik)"] + [
-                f"{r['id']} · {r['resolusi']} · {r['ext']} · {r['ukuran']}" for r in rows
-            ]
-            pick = st.selectbox("Format", labels, index=0)
-            if pick != labels[0]:
-                chosen_format = pick.split(" · ")[0]
+    persist(cfg)
+
+    root = Path(cfg["dl_dir"]).expanduser()
+    ok_dir, dir_err = storage.prepare(root)
+
+    st.title("🎬 " + APP)
+    if ok_dir:
+        st.caption(f"`{root}` · kosong {storage.human(storage.free_bytes(root))} · DNS {mode} · paralel {cfg['parallel']}")
     else:
-        st.session_state.setdefault("_noop", None)
+        st.error(f"Folder tidak siap: {dir_err}")
 
-    start = st.button(
-        "⬇️ Mulai unduh",
-        type="primary",
-        use_container_width=True,
-        disabled=not dir_ok,
-    )
+    # ------------------------------ tambah ------------------------------ #
+    with st.form("add", clear_on_submit=True):
+        url = st.text_input("Link", placeholder="https://...")
+        c1, c2 = st.columns([1, 3])
+        probe = c1.form_submit_button("Cek format", use_container_width=True)
+        add = c2.form_submit_button("Tambah ke antrean", type="primary", use_container_width=True)
+        if add and url:
+            good, msg = mgr.add(url)
+            (st.success if good else st.warning)("Masuk antrean." if good else msg)
+        if probe and url:
+            st.session_state["probe_url"] = url
 
-    if start:
-        urls = [u.strip() for u in url_text.splitlines() if u.strip()]
-        if not urls:
-            st.warning("Isi minimal satu link.")
-        elif not FFMPEG and (audio_only or thumb):
-            st.error("ffmpeg belum terpasang, matikan opsi audio/thumbnail.")
-        else:
-            ui = UI()
-            results: list[tuple[str, bool, str]] = []
-            for idx, url in enumerate(urls, start=1):
-                st.markdown(f"**({idx}/{len(urls)})** `{url}`")
-                ui.reset()
-                logger = YTLogger()
-                cfg = {
-                    "dl_dir": dl_dir,
-                    "fragments": fragments,
-                    "chunk": chunk,
-                    "rate": rate,
-                    "proxy": proxy,
-                    "insecure": insecure,
-                    "cookies": str(cookies_path) if cookies_path else None,
-                    "impersonate": use_impersonate,
-                    "aria2c": use_aria2c,
-                    "playlist": playlist,
-                    "audio_only": audio_only,
-                    "subs": subs,
-                    "thumb": thumb,
-                    "format": chosen_format,
-                    "logger": logger,
-                    "hook": ui.hook,
-                    "pp_hook": ui.hook,
-                }
-                try:
-                    with yt_dlp.YoutubeDL(build_opts(cfg)) as ydl:
-                        ydl.download([url])
-                    results.append((url, True, ""))
-                    ui.bar.progress(1.0, text="Selesai")
-                except Exception as exc:
-                    results.append((url, False, str(exc)))
-                    ui.bar.progress(0.0, text="Gagal")
-                with st.expander(
-                    f"Log #{idx}", expanded=not results[-1][1]
-                ):
-                    st.code("\n".join(logger.lines[-200:]) or "(tidak ada output)")
+    bulk = st.text_area("Tambah massal (satu per baris)", height=90)
+    if st.button("Masukkan semua", disabled=not bulk.strip()):
+        added = 0
+        for line in bulk.splitlines():
+            if line.strip():
+                good, _ = mgr.add(line.strip())
+                added += 1 if good else 0
+        st.success(f"{added} link masuk antrean.")
 
-            ok = sum(1 for _, good, _ in results if good)
-            st.success(f"{ok}/{len(results)} link berhasil diunduh.")
-            for url, good, err in results:
-                if not good:
-                    st.error(f"{url}\n\n{err}")
+    probe_url = st.session_state.get("probe_url")
+    if probe_url:
+        try:
+            import yt_dlp
 
+            with st.spinner("Mengambil metadata..."):
+                with yt_dlp.YoutubeDL(
+                    {"quiet": True, "no_warnings": True, "noprogress": True,
+                     "skip_download": True, "noplaylist": True}
+                ) as ydl:
+                    info = ydl.extract_info(probe_url, download=False) or {}
+            st.markdown(f"**{info.get('title','(tanpa judul)')}** · {storage.human_time(info.get('duration'))}")
+            rows = [
+                {"id": f.get("format_id"), "res": f.get("resolution") or "-",
+                 "ext": f.get("ext"), "size": storage.human(f.get("filesize") or f.get("filesize_approx"))}
+                for f in (info.get("formats") or [])
+                if f.get("vcodec") != "none" or f.get("acodec") != "none"
+            ]
+            pick = st.selectbox("Format", ["auto"] + [f"{r['id']} · {r['res']} · {r['ext']} · {r['size']}" for r in rows])
+            if st.button("Tambah dengan format ini", type="primary"):
+                fmt = None if pick == "auto" else pick.split(" · ")[0]
+                good, msg = mgr.add(probe_url, fmt)
+                (st.success if good else st.warning)("Masuk antrean." if good else msg)
+        except Exception as exc:
+            st.error(f"Gagal probe: {exc}")
+
+    # ------------------------------ antrean ----------------------------- #
     st.divider()
-    st.subheader("File di folder tujuan")
-    if dir_ok:
-        files = sorted(
-            (
-                p
-                for p in dl_dir.iterdir()
-                if p.is_file() and not p.name.endswith((".part", ".ytdl", ".tmp"))
-            ),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )[:30]
+    st.subheader("Antrean")
+
+    @st.fragment(run_every="1.2s")
+    def queue_view() -> None:
+        stats = mgr.stats()
+        st.caption(
+            f"antre {stats['queued']} · aktif {stats['active']} · "
+            f"selesai {stats['done']} · gagal {stats['failed']} · "
+            f"terunduh {storage.human(stats['session_bytes'])}"
+        )
+        jobs = mgr.snapshot()
+        if not jobs:
+            st.caption("Antrean kosong.")
+        for job in jobs:
+            icon = {
+                "done": "✅", "error": "⛔", "cancelled": "⏹", "exists": "♻️",
+                "no_space": "💾", "paused": "⏸", "queued": "🕒",
+            }.get(job["status"], "⬇️")
+            with st.container(border=True):
+                st.markdown(f"{icon} **{job['title'][:110]}**  \n`{job['url'][:90]}`")
+                if job["status"] == "downloading":
+                    total = job["total"] or 0
+                    frac = (job["done"] / total) if total else 0.0
+                    st.progress(min(max(frac, 0.0), 1.0))
+                    st.caption(
+                        f"{storage.human(job['done'])} / {storage.human(total) if total else '?'} · "
+                        f"{storage.human(job['speed'])}/s · sisa {storage.human_time(job['eta'])}"
+                    )
+                elif job["status"] == "processing":
+                    st.info("Memproses file (merge/konversi)...")
+                elif job["status"] == "error":
+                    st.error(job["error"])
+                    if job["hint"]:
+                        st.caption("Saran: " + job["hint"])
+                elif job["status"] == "exists":
+                    st.caption(f"Sudah ada: {Path(job['filepath']).name if job['filepath'] else '-'}")
+                elif job["status"] == "no_space":
+                    st.warning("Ruang tidak cukup. " + (job["hint"] or ""))
+
+                cols = st.columns(5)
+                if job["status"] in {"queued", "downloading", "processing", "probing"}:
+                    if cols[0].button("Batal", key=f"c{job['id']}", use_container_width=True):
+                        mgr.cancel(job["id"])
+                if job["status"] in {"error", "cancelled", "paused", "no_space"}:
+                    if cols[1].button("Ulangi", key=f"r{job['id']}", use_container_width=True):
+                        mgr.resume(job["id"])
+                if job["status"] == "downloading":
+                    if cols[2].button("Jeda", key=f"p{job['id']}", use_container_width=True):
+                        mgr.pause(job["id"])
+                if job["status"] in {"error", "cancelled", "done", "exists", "no_space"}:
+                    if cols[3].button("Hapus", key=f"x{job['id']}", use_container_width=True):
+                        mgr.remove(job["id"])
+                with cols[4].popover("Log", use_container_width=True):
+                    st.code("\n".join(job["log"]) or "(kosong)")
+
+        a, b = st.columns(2)
+        if a.button("Ulangi semua gagal", use_container_width=True):
+            st.toast(f"{mgr.retry_failed()} job diulang")
+        if b.button("Bersihkan selesai", use_container_width=True):
+            mgr.clear_finished()
+
+    queue_view()
+
+    # ----------------------------- file manager -------------------------- #
+    st.divider()
+    st.subheader("File")
+    if ok_dir:
+        sites = sorted({p.name.split(" - ")[0] for p in storage.list_media(root)}) if root.exists() else []
+        f1, f2 = st.columns(2)
+        site = f1.selectbox("Filter situs", ["semua"] + sites)
+        sort = f2.selectbox("Urutkan", ["terbaru", "terlama", "terbesar", "nama"])
+        files = storage.list_media(root, "" if site == "semua" else site, sort)[:80]
         if not files:
             st.caption("Belum ada file.")
-        for path in files:
-            size = path.stat().st_size
-            left, right = st.columns([4, 1])
-            left.markdown(f"`{path.name}`  \n{human(size)}")
-            with open(path, "rb") as fh:
-                right.download_button(
-                    "Simpan ke HP",
-                    data=fh,
-                    file_name=path.name,
-                    mime="application/octet-stream",
-                    key=f"dl_{path.name}_{size}",
-                    use_container_width=True,
+        for p in files:
+            try:
+                size = p.stat().st_size
+            except Exception:
+                continue
+            with st.container(border=True):
+                st.markdown(f"`{p.name}`  \n{storage.human(size)}")
+                c1, c2, c3 = st.columns(3)
+                with open(p, "rb") as fh:
+                    c1.download_button(
+                        "Simpan ke HP", data=fh, file_name=p.name,
+                        mime="application/octet-stream", key=f"d{p.name}{size}", use_container_width=True,
+                    )
+                with c2.popover("Pratinjau", use_container_width=True):
+                    if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}:
+                        st.video(str(p))
+                    elif p.suffix.lower() in {".jpg", ".png", ".webp"}:
+                        st.image(str(p))
+                    else:
+                        st.caption("Tidak ada pratinjau.")
+                if c3.button("Hapus", key=f"del{p.name}{size}", use_container_width=True):
+                    try:
+                        p.unlink()
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
+        with st.expander("Aksi massal"):
+            names = [p.name for p in files]
+            chosen = st.multiselect("Pilih file", names)
+            target = st.text_input("Folder tujuan pindah", value="/storage/emulated/0/Movies/VeniceGrab")
+            b1, b2 = st.columns(2)
+            if b1.button("Pindahkan terpilih", use_container_width=True) and chosen:
+                moved = storage.move_in([root / n for n in chosen if (root / n).exists()], Path(target).expanduser())
+                st.success(f"{len(moved)} file dipindahkan.")
+            if b2.button("Zip terpilih", use_container_width=True) and chosen:
+                zpath = root / "arsip.zip"
+                with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED) as zf:
+                    for n in chosen:
+                        src = root / n
+                        if src.exists():
+                            zf.write(src, src.name)
+                st.success(f"Zip dibuat: {zpath.name}")
+
+    # ------------------------------ perawatan ---------------------------- #
+    st.divider()
+    with st.expander("Perawatan"):
+        st.write(f"yt-dlp terpasang: `{_ver()}` · terbaru: `{latest_ytdlp()}`")
+        if st.button("Update yt-dlp sekarang"):
+            with st.spinner("Memperbarui..."):
+                proc = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp"],
+                    capture_output=True, text=True, timeout=300,
                 )
-    else:
-        st.caption("Folder tujuan belum valid.")
+            if proc.returncode == 0:
+                st.success("Diperbarui. Restart app agar aktif.")
+            else:
+                st.error(proc.stderr[-800:])
+        days = st.number_input("Hapus file lebih tua dari (hari)", 1, 365, int(cfg["cleanup_days"]))
+        cfg["cleanup_days"] = days
+        if st.button("Bersihkan file lama"):
+            n, freed = storage.cleanup_old(root, int(days))
+            st.success(f"{n} file dihapus, {storage.human(freed)} dibebaskan.")
+        if st.button("Reset arsip duplikat"):
+            try:
+                (root / storage.ARCHIVE).unlink()
+                st.success("Arsip dihapus.")
+            except Exception:
+                st.caption("Arsip belum ada.")
+
+
+def _ver() -> str:
+    try:
+        import yt_dlp
+
+        return yt_dlp.version.__version__
+    except Exception:
+        return "?"
 
 
 if __name__ == "__main__":
