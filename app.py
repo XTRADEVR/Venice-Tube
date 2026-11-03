@@ -2,7 +2,19 @@
 # -*- coding: utf-8 -*-
 """Venice Tube Grabber — FIXED BLUE SHIMMER + NO ARCHIVE BUG + 1GB OPTIMIZED"""
 from __future__ import annotations
-import hashlib, hmac, os, queue, re, shutil, socket, subprocess, sys, threading, time, uuid, zipfile
+import hashlib
+import hmac
+import os
+import queue
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import zipfile
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,8 +32,9 @@ FFMPEG = shutil.which("ffmpeg")
 MEDIA_EXT = {".mp4",".mkv",".webm",".avi",".mov",".flv",".ts",".m4v",".mp3",".m4a",".opus",".ogg",".flac",".wav",".srt",".vtt",".ass",".jpg",".png",".webp"}
 BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 IS_ANDROID = Path("/storage/emulated/0").exists() or Path("/sdcard").exists()
+
 st.set_page_config(page_title=APP, page_icon="🎬", layout="centered")
-st.markdown('''
+st.markdown("""
 <style>
 .stApp{background:radial-gradient(ellipse at top left,#061a3a 0%,#0a2e6b 25%,#1565c0 60%,#1e88e5 85%,#42a5f5 100%);background-attachment:fixed}
 .stApp::before{content:"";position:fixed;inset:0;background-image:radial-gradient(circle at 20% 30%,rgba(255,255,255,0.15) 0%,transparent 50%),radial-gradient(circle at 80% 70%,rgba(100,200,255,0.2) 0%,transparent 40%);pointer-events:none;animation:shimmerMove 12s infinite ease-in-out}
@@ -30,64 +43,87 @@ st.markdown('''
 [data-testid="stHeader"]{background:rgba(0,0,0,0)!important}
 h1,h2,h3{color:#e3f2fd!important;text-shadow:0 0 15px rgba(66,165,245,0.6)}
 </style>
-''', unsafe_allow_html=True)
+""", unsafe_allow_html=True)
+
 try:
-    import dns.message, dns.rdatatype, dns.resolver, requests
-    HAS_DNS=True
-except: HAS_DNS=False
-CF_V4=["1.1.1.1","1.0.0.1"]
-CF_DOH="https://cloudflare-dns.com/dns-query"
-_ORIG_GA=socket.getaddrinfo
-_ORIG_GH=socket.gethostbyname
+    import dns.message
+    import dns.rdatatype
+    import dns.resolver
+    import requests
+    HAS_DNS = True
+except Exception:
+    HAS_DNS = False
+
+CF_V4 = ["1.1.1.1", "1.0.0.1"]
+CF_DOH = "https://cloudflare-dns.com/dns-query"
+_ORIG_GA = socket.getaddrinfo
+_ORIG_GH = socket.gethostbyname
+
 class DNSRouter:
     def __init__(self):
-        self._cache={}; self._lock=threading.Lock(); self._local=threading.local(); self.mode="system"; self.ipv4_only=True; self.ttl=300.0; self._installed=False; self._resolver=None
+        self._cache = {}
+        self._lock = threading.Lock()
+        self._local = threading.local()
+        self.mode = "system"
+        self.ipv4_only = True
+        self.ttl = 300.0
+        self._installed = False
+        self._resolver = None
         if HAS_DNS:
-            self._resolver=dns.resolver.Resolver(configure=False); self._resolver.nameservers=CF_V4; self._resolver.timeout=4.0; self._resolver.lifetime=6.0
-    def _doh(self,name,rdtype):
-        q=dns.message.make_query(name,rdtype,use_edns=False)
-        r=requests.post(CF_DOH,data=q.to_wire(),headers={"Content-Type":"application/dns-message","Accept":"application/dns-message","User-Agent":UA},timeout=8)
-        r.raise_for_status(); msg=dns.message.from_wire(r.content)
-        return [rr.address for rs in msg.answer if rs.rdtype==rdtype for rr in rs]
-    def _udp(self,name,rdtype):
-        ans=self._resolver.resolve(name,rdtype,raise_on_no_answer=False)
+            self._resolver = dns.resolver.Resolver(configure=False)
+            self._resolver.nameservers = CF_V4
+            self._resolver.timeout = 4.0
+            self._resolver.lifetime = 6.0
+    def _doh(self, name, rdtype):
+        q = dns.message.make_query(name, rdtype, use_edns=False)
+        r = requests.post(CF_DOH, data=q.to_wire(), headers={"Content-Type": "application/dns-message","Accept": "application/dns-message","User-Agent": UA}, timeout=8)
+        r.raise_for_status()
+        msg = dns.message.from_wire(r.content)
+        return [rr.address for rs in msg.answer if rs.rdtype == rdtype for rr in rs]
+    def _udp(self, name, rdtype):
+        ans = self._resolver.resolve(name, rdtype, raise_on_no_answer=False)
         return [] if ans.rrset is None else [r.address for r in ans]
-    def resolve(self,host,want4,want6):
+    def resolve(self, host, want4, want6):
         if not HAS_DNS or self._resolver is None: return []
-        key=(host,int(want4),int(want6),self.mode); now=time.monotonic()
+        key = (host, int(want4), int(want6), self.mode)
+        now = time.monotonic()
         with self._lock:
-            hit=self._cache.get(key)
-            if hit and hit[0]>now: return list(hit[1])
-        ips=[]; types=([dns.rdatatype.A] if want4 else [])+([dns.rdatatype.AAAA] if want6 else [])
+            hit = self._cache.get(key)
+            if hit and hit[0] > now: return list(hit[1])
+        ips = []
+        types = ([dns.rdatatype.A] if want4 else []) + ([dns.rdatatype.AAAA] if want6 else [])
         for rdtype in types:
-            try: ips.extend(self._doh(host,rdtype) if self.mode=="doh" else self._udp(host,rdtype))
+            try: ips.extend(self._doh(host, rdtype) if self.mode=="doh" else self._udp(host, rdtype))
             except: continue
         with self._lock:
-            if len(self._cache)>2000: self._cache.clear()
-            self._cache[key]=(now+self.ttl,list(ips))
+            if len(self._cache) > 2000: self._cache.clear()
+            self._cache[key] = (now+self.ttl, list(ips))
         return ips
-    def _ga(self,host,port,family=0,type=0,proto=0,flags=0):
-        orig=_ORIG_GA
-        if self.mode=="system" or not HAS_DNS or host is None or isinstance(host,bytes) or getattr(self._local,"busy",False): return orig(host,port,family,type,proto,flags)
-        host=str(host)
-        for fam,probe in ((socket.AF_INET,socket.inet_pton),(socket.AF_INET6,socket.inet_pton)):
-            try: probe(fam,host); return orig(host,port,family,type,proto,flags)
+    def _ga(self, host, port, family=0, type=0, proto=0, flags=0):
+        orig = _ORIG_GA
+        if self.mode=="system" or not HAS_DNS or host is None or isinstance(host, bytes) or getattr(self._local, "busy", False):
+            return orig(host, port, family, type, proto, flags)
+        host = str(host)
+        for fam, probe in ((socket.AF_INET, socket.inet_pton),(socket.AF_INET6, socket.inet_pton)):
+            try: probe(fam, host); return orig(host, port, family, type, proto, flags)
             except OSError: pass
-        want6=family==socket.AF_INET6 or (family==0 and not self.ipv4_only); want4=family in (0,socket.AF_INET)
-        self._local.busy=True
-        try: ips=self.resolve(host,want4,want6)
-        finally: self._local.busy=False
-        if not ips: return orig(host,port,family,type,proto,flags)
-        socktype=type or socket.SOCK_STREAM; out=[]
+        want6 = family==socket.AF_INET6 or (family==0 and not self.ipv4_only)
+        want4 = family in (0, socket.AF_INET)
+        self._local.busy = True
+        try: ips = self.resolve(host, want4, want6)
+        finally: self._local.busy = False
+        if not ips: return orig(host, port, family, type, proto, flags)
+        socktype = type or socket.SOCK_STREAM
+        out = []
         for ip in ips:
             if ":" in ip:
                 if family==socket.AF_INET: continue
-                out.append((socket.AF_INET6,socktype,proto or 0,"",(ip,port or 0,0,0)))
+                out.append((socket.AF_INET6, socktype, proto or 0, "", (ip, port or 0, 0, 0)))
             else:
                 if family==socket.AF_INET6: continue
-                out.append((socket.AF_INET,socktype,proto or 0,"",(ip,port or 0)))
-        return out or orig(host,port,family,type,proto,flags)
-    def _gh(self,host):
+                out.append((socket.AF_INET, socktype, proto or 0, "", (ip, port or 0)))
+        return out or orig(host, port, family, type, proto, flags)
+    def _gh(self, host):
         if self.mode=="system" or not HAS_DNS: return _ORIG_GH(host)
         try:
             for fam,_,_,_,sa in self._ga(host,0,socket.AF_INET,socket.SOCK_STREAM):
@@ -98,11 +134,9 @@ class DNSRouter:
         if not self._installed and HAS_DNS:
             socket.getaddrinfo=self._ga; socket.gethostbyname=self._gh; self._installed=True
     def probe(self):
-        if not HAS_DNS: return False,"dnspython belum terpasang"
+        if not HAS_DNS: return False, "dnspython belum terpasang"
         t0=time.perf_counter(); ips=self.resolve("one.one.one.one",True,False); ms=(time.perf_counter()-t0)*1000
-        return (True,f"{ms:.0f} ms -> {ips[0]}") if ips else (False,"tidak ada jawaban")
-
-def human(num):
+        return (True,f"{ms:.0f} ms -> {ips[0]}") if ips else (False,"tidak ada jawaban")def human(num):
     try: num=float(num)
     except: return "?"
     if num<=0: return "0 B"
@@ -110,22 +144,28 @@ def human(num):
         if num<1024 or unit=="TB": return f"{num:.1f} {unit}"
         num/=1024
     return "?"
+
 def human_time(sec):
     try: sec=int(sec)
     except: return "--:--"
     if sec<0: return "--:--"
     m,s=divmod(sec,60); h,m=divmod(m,60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
 def default_dir(): return str(BASE / "downloads")
+
 def prepare(root: Path):
     try:
-        root.mkdir(parents=True,exist_ok=True); (root / INCOMING).mkdir(exist_ok=True)
+        root.mkdir(parents=True,exist_ok=True)
+        (root / INCOMING).mkdir(exist_ok=True)
         t=root / ".write_test"; t.write_bytes(b"1"); t.unlink()
         return True,""
     except Exception as exc: return False,str(exc)
+
 def free_bytes(path: Path):
     try: return shutil.disk_usage(path).free
     except: return 0
+
 def site_of(url: str):
     m=re.match(r"https?://([^/]+)",url or "")
     if not m: return "web"
@@ -133,14 +173,18 @@ def site_of(url: str):
     for pre in ("www.","m."):
         if host.startswith(pre): host=host[len(pre):]
     return BAD.sub("",host)[:40] or "web"
+
 def sanitize(text,restrict=False,limit=100):
     text=BAD.sub(" ",text or ""); text=re.sub(r"\s+"," ",text).strip(" .")
-    if restrict: text=re.sub(r"[^A-Za-z0-9 ._-]","",text); text=re.sub(r"\s+","_",text.strip())
+    if restrict:
+        text=re.sub(r"[^A-Za-z0-9 ._-]","",text); text=re.sub(r"\s+","_",text.strip())
     return text[:limit].rstrip(" .") or "video"
+
 def unique_path(folder,stem,ext):
     ext=ext if ext.startswith(".") else f".{ext}"; cand=folder / f"{stem}{ext}"; i=2
     while cand.exists(): cand=folder / f"{stem} ({i}){ext}"; i+=1
     return cand
+
 def find_existing(folder,vid):
     if not vid: return None
     tag=f"[{sanitize(vid,True,40)}]"
@@ -149,6 +193,7 @@ def find_existing(folder,vid):
             if p.is_file() and tag in p.name and not p.name.endswith((".part",".ytdl")): return p
     except: pass
     return None
+
 def move_in(paths,dest):
     dest.mkdir(parents=True,exist_ok=True); moved=[]
     for src in paths:
@@ -156,6 +201,7 @@ def move_in(paths,dest):
             target=unique_path(dest,src.stem,src.suffix); shutil.move(str(src),str(target)); moved.append(target)
         except: continue
     return moved
+
 def collect_new(folder,since):
     out=[]
     try:
@@ -163,6 +209,7 @@ def collect_new(folder,since):
             if p.is_file() and p.stat().st_mtime>=since and not p.name.endswith(".part"): out.append(p)
     except: pass
     return out
+
 def list_media(folder,site="",sort="terbaru"):
     items=[]
     try:
@@ -173,6 +220,7 @@ def list_media(folder,site="",sort="terbaru"):
     except: return []
     keys={"terbaru":lambda p:p.stat().st_mtime,"terlama":lambda p:p.stat().st_mtime,"terbesar":lambda p:p.stat().st_size,"nama":lambda p:p.name.lower()}
     return sorted(items,key=keys.get(sort,keys["terbaru"]),reverse=sort in ("terbaru","terbesar"))
+
 def cleanup_old(folder,days):
     cutoff=time.time()-days*86400; count=freed=0
     try:
@@ -182,6 +230,7 @@ def cleanup_old(folder,days):
     return count,freed
 
 DEFAULTS={"dl_dir":"","dns_mode":"udp","ipv4_only":True,"fragments":4,"chunk":3145728,"rate":0.0,"parallel":1,"compat":True,"quality":"720","restrict":False,"audio_only":False,"subs":False,"thumb":False,"playlist":False,"insecure":False,"proxy":"","cookies":"","margin_mb":100,"quota_gb":2.0,"cleanup_days":30}
+
 def load_cfg():
     import json; cfg=dict(DEFAULTS)
     try:
@@ -193,6 +242,7 @@ def load_cfg():
     except: pass
     if not cfg.get("dl_dir"): cfg["dl_dir"]=default_dir()
     return cfg
+
 def save_cfg(cfg):
     import json
     try: CFG_DIR.mkdir(parents=True,exist_ok=True); tmp=CFG_FILE.with_suffix(".tmp"); tmp.write_text(json.dumps(cfg,indent=2),"utf-8"); tmp.replace(CFG_FILE)
@@ -203,23 +253,61 @@ DONE,ERROR,CANCELLED,PAUSED,EXISTS,NO_SPACE="done","error","cancelled","paused",
 ACTIVE={PROBING,DOWNLOADING,PROCESSING}
 FINISHED={DONE,ERROR,CANCELLED,EXISTS,NO_SPACE}
 HINTS=(("sign in to confirm","Butuh cookies"),("login","Butuh login"),("private video","Video privat"),("403","Diblokir"),("429","Rate limit"),("404","Link mati"),("unsupported url","Belum didukung"),("no space left","Ruang habis"),("ffmpeg","ffmpeg error"),("timed out","Timeout"),("connection","Koneksi gagal"),("geo","Geo block"))
+
 def classify(msg):
     low=(msg or "").lower()
     for needle,hint in HINTS:
         if needle in low: return hint
-    class _Logger:
-    def __init__(self,job): self.job=job
-    def debug(self,msg):
-        if not msg.startswith("[debug]"): self.job.log.append(msg)
-    def info(self,msg): self.job.log.append(msg)
-    def warning(self,msg): self.job.log.append(f"WARN: {msg}")
-    def error(self,msg): self.job.log.append(f"ERROR: {msg}")
+    return "Buka log job"
+
+class Cancelled(Exception): pass
+
+@dataclass
+class Job:
+    url: str
+    fmt: str | None = None
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
+    status: str = QUEUED
+    title: str = ""
+    site: str = ""
+    vid: str = ""
+    duration: float | None = None
+    total: int = 0
+    done: int = 0
+    speed: float = 0.0
+    eta: int | None = None
+    filepath: str | None = None
+    error: str | None = None
+    hint: str | None = None
+    log: deque = field(default_factory=lambda: deque(maxlen=300))
+    cancel: threading.Event = field(default_factory=threading.Event)
+    skip: bool = False
+
+class _Logger:
+    def __init__(self, job):
+        self.job = job
+    def debug(self, msg):
+        if not msg.startswith("[debug]"):
+            self.job.log.append(msg)
+    def info(self, msg):
+        self.job.log.append(msg)
+    def warning(self, msg):
+        self.job.log.append(f"WARN: {msg}")
+    def error(self, msg):
+        self.job.log.append(f"ERROR: {msg}")
 
 class JobManager:
-    def __init__(self,cfg):
+    def __init__(self, cfg):
         self.cfg=dict(cfg); self._jobs={}; self._lock=threading.RLock(); self._q=queue.Queue(); self._stop=threading.Event(); self._workers=[]; self._target=max(1,min(int(cfg.get("parallel",1) or 1),4)); self.session_bytes=0; self._ensure_workers()
+    def update_cfg(self, cfg):
+        self.cfg=dict(cfg); want=max(1,min(int(cfg.get("parallel",1) or 1),4))
+        if want!=self._target: self._target=want; self._ensure_workers()
+    def _ensure_workers(self):
+        with self._lock:
+            self._workers=[w for w in self._workers if w.is_alive()]
+            while len(self._workers)<self._target:
                 t=threading.Thread(target=self._loop,daemon=True); t.start(); self._workers.append(t)
-    def add(self,url,fmt=None):
+    def add(self, url, fmt=None):
         url=(url or "").strip()
         if not url.lower().startswith(("http://","https://")): return False,"URL harus http"
         with self._lock:
@@ -227,14 +315,14 @@ class JobManager:
                 if job.url==url and job.status in ACTIVE | {QUEUED,PAUSED}: return False,"URL sudah ada"
             job=Job(url=url,fmt=fmt); self._jobs[job.id]=job
         self._q.put(job.id); return True,job.id
-    def cancel(self,job_id):
+    def cancel(self, job_id):
         job=self._get(job_id)
         if job: job.cancel.set()
         if job and job.status==QUEUED: job.skip=True; job.status=CANCELLED
-    def pause(self,job_id):
+    def pause(self, job_id):
         job=self._get(job_id)
         if job and job.status in ACTIVE: job.cancel.set(); job.status=PAUSED
-    def resume(self,job_id):
+    def resume(self, job_id):
         with self._lock:
             job=self._jobs.get(job_id)
             if not job: return
@@ -245,13 +333,13 @@ class JobManager:
         for job in list(self._jobs.values()):
             if job.status in {ERROR,NO_SPACE}: self.resume(job.id); n+=1
         return n
-    def remove(self,job_id):
+    def remove(self, job_id):
         with self._lock: job=self._jobs.pop(job_id,None)
         if job: job.cancel.set()
     def clear_finished(self):
         for job in list(self._jobs.values()):
             if job.status in FINISHED: self.remove(job.id)
-    def _get(self,job_id):
+    def _get(self, job_id):
         with self._lock: return self._jobs.get(job_id)
     def snapshot(self):
         with self._lock: jobs=list(self._jobs.values())
@@ -268,7 +356,7 @@ class JobManager:
             try: self._run(job)
             except Cancelled: job.status=CANCELLED
             except Exception as exc: job.status=ERROR; job.error=str(exc); job.hint=classify(str(exc))
-    def _opts(self,job,incoming):
+    def _opts(self, job, incoming):
         cfg=self.cfg
         opts={"paths":{"home":str(incoming),"temp":str(incoming)},"outtmpl":{"default":"%(title).80B [%(id)s].%(ext)s"},"windowsfilenames":True,"restrictfilenames":bool(cfg.get("restrict")),"trim_file_name":110,"overwrites":True,"continuedl":True,"updatetime":False,"quiet":True,"noprogress":True,"no_warnings":True,"retries":15,"fragment_retries":15,"socket_timeout":30,"concurrent_fragment_downloads":int(cfg.get("fragments",4)),"http_chunk_size":int(cfg.get("chunk",3145728)),"geo_bypass":True,"nocheckcertificate":bool(cfg.get("insecure")),"http_headers":{"User-Agent":UA},"logger":_Logger(job),"progress_hooks":[self._hook(job)],"postprocessor_hooks":[self._pp(job)],"noplaylist":not bool(cfg.get("playlist")),"ignoreerrors":False}
         if cfg.get("proxy"): opts["proxy"]=cfg["proxy"]
@@ -289,18 +377,18 @@ class JobManager:
         if cfg.get("thumb") and FFMPEG: opts["writethumbnail"]=True; pps.append({"key":"EmbedThumbnail","already_have_thumbnail":False})
         if pps: opts["postprocessors"]=pps
         return opts
-    def _hook(self,job):
+    def _hook(self, job):
         def hook(d):
             if job.cancel.is_set(): raise Cancelled()
             if d.get("status")=="downloading": job.status=DOWNLOADING; job.done=int(d.get("downloaded_bytes") or 0); job.total=int(d.get("total_bytes") or d.get("total_bytes_estimate") or 0); job.speed=float(d.get("speed") or 0.0); job.eta=d.get("eta")
             elif d.get("status")=="finished": job.status=PROCESSING
         return hook
-    def _pp(self,job):
+    def _pp(self, job):
         def hook(d):
             if job.cancel.is_set(): raise Cancelled()
             if d.get("status")=="started": job.status=PROCESSING
         return hook
-    def _run(self,job):
+    def _run(self, job):
         root=Path(self.cfg["dl_dir"]).expanduser(); incoming=root / INCOMING; root.mkdir(parents=True,exist_ok=True); incoming.mkdir(parents=True,exist_ok=True)
         job.site=site_of(job.url); job.status=PROBING
         probe={"quiet":True,"noprogress":True,"no_warnings":True,"skip_download":True,"socket_timeout":30,"noplaylist":True,"http_headers":{"User-Agent":UA},"logger":_Logger(job)}
@@ -335,6 +423,7 @@ def expected_password():
     try: secret=st.secrets.get("APP_PASSWORD")
     except: secret=None
     return (secret or os.environ.get("APP_PASSWORD") or "").strip()
+
 def login_gate():
     want=expected_password()
     if not want or st.session_state.get("authed"): return True
