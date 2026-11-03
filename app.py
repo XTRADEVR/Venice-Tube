@@ -207,27 +207,17 @@ def classify(msg):
     low=(msg or "").lower()
     for needle,hint in HINTS:
         if needle in low: return hint
-    return "Buka log job"
-class Cancelled(Exception): pass
-@dataclass
-class Job:
-    url:str; fmt:str|None=None; id:str=field(default_factory=lambda: uuid.uuid4().hex[:10]); status:str=QUEUED; title:str=""; site:str=""; vid:str=""; duration:float|None=None; total:int=0; done:int=0; speed:float=0.0; eta:int|None=None; filepath:str|None=None; error:str|None=None; hint:str|None=None; log:deque=field(default_factory=lambda: deque(maxlen=300)); cancel:threading.Event=field(default_factory=threading.Event); skip:bool=False
-class _Logger:
+    class _Logger:
     def __init__(self,job): self.job=job
     def debug(self,msg):
         if not msg.startswith("[debug]"): self.job.log.append(msg)
     def info(self,msg): self.job.log.append(msg)
     def warning(self,msg): self.job.log.append(f"WARN: {msg}")
-    def error(self,msg): self.job.log.append(f"ERROR: {msg}")class JobManager:
+    def error(self,msg): self.job.log.append(f"ERROR: {msg}")
+
+class JobManager:
     def __init__(self,cfg):
         self.cfg=dict(cfg); self._jobs={}; self._lock=threading.RLock(); self._q=queue.Queue(); self._stop=threading.Event(); self._workers=[]; self._target=max(1,min(int(cfg.get("parallel",1) or 1),4)); self.session_bytes=0; self._ensure_workers()
-    def update_cfg(self,cfg):
-        self.cfg=dict(cfg); want=max(1,min(int(cfg.get("parallel",1) or 1),4))
-        if want!=self._target: self._target=want; self._ensure_workers()
-    def _ensure_workers(self):
-        with self._lock:
-            self._workers=[w for w in self._workers if w.is_alive()]
-            while len(self._workers)<self._target:
                 t=threading.Thread(target=self._loop,daemon=True); t.start(); self._workers.append(t)
     def add(self,url,fmt=None):
         url=(url or "").strip()
